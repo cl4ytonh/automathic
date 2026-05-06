@@ -1,146 +1,144 @@
 import json
-import sympy
 import os
-from openai import OpenAI
 import pandas as pd
-import matplotlib.pyplot as plt
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
-client = OpenAI(api_key = os.getenv("OPENAI_API_KEY"))
-MODEL = "gpt-4o-mini" # cheap, quick model
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+MODEL = "gpt-4o-mini"
 
-# below code is for testing and reference
-
-# response = client.chat.completions.create(
-#     model = MODEL,
-#     messages = [
-#         {"role": "system", "content": "You are a helpful math tutor."},
-#         {"role": "user", "content": "Solve: 2x + 3y = 12, -4x + 6y = -8"}
-#     ]
-# )
-
-# print(response.choices[0].message.content)
-
-# Dataset Loading Code
 df = pd.read_parquet("./math_problems.parquet")
+df = df.dropna(subset=["problem", "solution"])
 
-print("Total problems:", len(df))
+def retrieve_reference(problem):
+    for _, row in df.iterrows():
+        if problem.strip() == row["problem"].strip():
+            return row["solution"]
 
-df["problem_length"] = df["problem"].apply(len)
-df["solution_length"] = df["solution"].apply(len)
+    # in case better reference check doesnt work
+    for _, row in df.iterrows():
+        if problem.split()[0] in row["problem"]:
+            return row["solution"]
 
-print("Problem length stats:")
-print(df["problem_length"].describe())
+    return None
 
-print("Solution length stats:")
-print(df["solution_length"].describe())
-
-plt.hist(df["solution_length"], bins=30)
-plt.title("Distribution of Solution Lengths")
-plt.xlabel("Length")
-plt.ylabel("Frequency")
-plt.show()
-
-def generate_plan(problem):
-    # need to format the code like this so the GPT model explicitly knowns how to format its answer so it does not outright solve the problem
+def generate_plan(problem, reference_solution=None):
     prompt = f"""
-    Break this math problem down into step-by-step goals WITHOUT providing answers before the user guesses them and WITHOUT fully solving the problem.
-    Be sure to solve the problem using ONE clear method. Do not offer alternatives, as this is a linear step-by-step path.
+    Break this math problem into a STRICT step-by-step solution plan.
 
-    Problem: {problem}
+    Rules:
+    - Each step = exactly ONE operation
+    - No branching or alternatives
+    - Deterministic sequence only
 
-    Return a JSON of this EXACTLY this structure: 
-    {{
-      "steps": [
-        {{"step": 1, "goal": "..."}},
-        {{"step": 2, "goal": "..."}}
-      ]
-    }}
+    Problem:
+    {problem}
     """
 
+    if reference_solution:
+        prompt += f"""
+        Reference solution (for pattern guidance only, DO NOT copy directly):
+        {reference_solution}
+        """
+
+        prompt += """
+        Return JSON:
+        {
+          "steps": [
+            {"step": 1, "goal": "..."},
+            {"step": 2, "goal": "..."}
+          ]
+        }
+        """
+
     response = client.chat.completions.create(
-        model = MODEL,
-        response_format = {"type": "json_object"},
-        messages = [
-            {"role": "user", "content": prompt}
-        ]
+        model=MODEL,
+        response_format={"type": "json_object"},
+        messages=[{"role": "user", "content": prompt}]
     )
 
-    return response.choices[0].message.content
+    return json.loads(response.choices[0].message.content)["steps"]
 
-# print(generate_plan("Solve: 2x + 3y = 12, -4x + 6y = -8"))
-
-def ask_step(problem, step_goal):
+def ask_step(problem, step_goal, prev_goal=None, prev_answer=None):
     prompt = f"""
     You are a math tutor.
 
     Problem: {problem}
-    Current Goal: {step_goal}
+    Current step goal: {step_goal}
 
-    Explain briefly what the student needs to do, then ask a question that makes them perform the step.
+    {f"Previous step: {prev_goal}" if prev_goal else ""}
+    {f"Student answer: {prev_answer}" if prev_answer else ""}
 
-    NEVER provide the answer.
+    Explain ONLY what the student should do for this step.
+    Do NOT solve the problem.
+    Be concise.
     """
 
     response = client.chat.completions.create(
-        model = MODEL,
-        messages = [
-            {"role": "user", "content": prompt}
-        ]
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}]
     )
 
     return response.choices[0].message.content
 
-def evaluate_answer(problem, step_goal, student_answer):
+def evaluate_step(problem, step_goal, student_answer):
     prompt = f"""
+    You are a math tutor.
+
     Problem: {problem}
     Step goal: {step_goal}
     Student answer: {student_answer}
 
-    Decide if the student answer is correct/acceptable.
-
-    Respond ONLY with valid JSON:
+    Return JSON ONLY:
     {{
-        "correct": true/false,
-        "feedback": "brief praise if correct/short explanation or a hint if incorrect WITHOUT providing the answer"
-        "expected_answer": "provide an answer that would be accepted as correct for this step"
+      "feedback": "short hint or encouragement"
     }}
     """
 
     response = client.chat.completions.create(
-        model = MODEL,
-        response_format = {"type": "json_object"},
-        messages = [
-            {"role": "user", "content": prompt}
-        ]
+        model=MODEL,
+        response_format={"type": "json_object"},
+        messages=[{"role": "user", "content": prompt}]
     )
 
-    return response.choices[0].message.content
+    return json.loads(response.choices[0].message.content)
 
 def tutor_session():
-    problem = input("Enter your math problem here: ")
-    plan = json.loads(generate_plan(problem))["steps"]
+    problem = input("Enter your math problem:\n")
+    reference_solution = retrieve_reference(problem) # using the dataset to 
 
-    print(f'plan: {plan}')
-    
+    # if reference_solution:
+    #     print("found reference solution")
+    # else:
+    #     print("no reference found")
+
+    plan = generate_plan(problem, reference_solution)
+    # for p in plan:
+    #     print(p)
+
     current_step = 0
 
     while current_step < len(plan):
-        question = ask_step(problem, plan[current_step]["goal"])
-        print([current_step, plan[current_step]["goal"]])
-        print(question)
+        step_goal = plan[current_step]["goal"]
 
-        user_input = input("Your answer: ")
+        print(f"\n--- Step {current_step + 1} ---")
+        print(step_goal)
 
-        result = json.loads(evaluate_answer(problem, plan[current_step]["goal"], user_input))
+        # hint = ask_step(problem, step_goal, prev_goal, prev_answer)
+        # print("\nHint:")
+        # print(hint)
 
-        print(f'result: {result}')
-        if result['correct']:
-            current_step += 1
-            print("step increased")
-        print(result["feedback"])
-    print("Congratulations on solving the problem!")
+        user_input = input("\nYour answer: ")
+
+        feedback = evaluate_step(problem, step_goal, user_input)
+
+        print(feedback["feedback"])
+
+        current_step += 1
+
+    print("\nProblem complete!")
+
 
 tutor_session()
